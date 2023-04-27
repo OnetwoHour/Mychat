@@ -177,6 +177,7 @@ func savelog() {
 	/*Dummy*/
 }
 
+/*This may not work.*/
 func requestLogin(ID string, PW string) bool {
 	var url = `http://login:1000`
 	buffer := make([]byte, 8)
