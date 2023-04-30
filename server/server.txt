@@ -1,0 +1,2 @@
+# Chat server with golang.
+It recieve message and spread it.
