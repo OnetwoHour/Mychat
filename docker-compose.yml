@@ -1,0 +1,32 @@
+version: "3.7"
+services:
+  server:
+    depends_on:
+      - logindb
+    image: onetwohour/chat-server:0.2
+    ports:
+      - "3000:3000"
+    networks:
+      - default
+      - server-client-net
+  logindb:
+    image: mysql
+    volumes:
+      - chat-mysql-data:/var/lib/mysql
+      - ./init.sql:/data/application/init.sql
+    environment:
+      MYSQL_DATABASE: logindb
+      MYSQL_ROOT_PASSWORD: 1234
+    networks:
+      - default
+      - server-client-net
+    command: --init-file /data/application/init.sql
+    ports:
+      - "3306:3306"
+
+networks:
+  server-client-net:
+    driver: bridge
+
+volumes:
+  chat-mysql-data:
