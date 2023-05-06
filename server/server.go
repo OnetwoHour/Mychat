@@ -1,204 +1,205 @@
 package main
 
 import (
-	"io"
+	"database/sql"
+	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"time"
+	"strconv"
+	"strings"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
 )
 
-var clients = make(map[*websocket.Conn]string)
-var broadcast = make(chan Message)
-var logcast = make(chan Log)
+var channelList = make(map[string]int)
 var upgrader = websocket.Upgrader{}
-var PORT = 3000
+var logined = make(map[string]string)
+var channelUser = make(map[string]map[*websocket.Conn]bool)
+var message = make(map[string](chan Message))
 
-type Message struct {
-	Time     string `json:"time"`
-	Username string `json:"username"`
-	Message  string `json:"message"`
-	Connect  int    `json:"connect"`
+const MAX_USER = 30
+
+type LoginInfo struct {
+	ID       string `json:"id"`
+	PW       string `json:"pw"`
+	USERNAME string `json:"username"`
 }
 
-type Log struct {
-	Type    string `json:"type"` // E : Error S : Send, L : Link, O : Operation, F : File
-	Time    string `json:"time"`
-	Host    string `json:"host"`
-	Guest   string `json:"guest"`
-	Message string `json:"message"`
+type Message struct {
+	MSG string `json:"msg"`
+	ID  string `json:"id"`
 }
 
 func main() {
-	fpLog, err := os.OpenFile("logfile.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		panic(err)
-	}
-	defer fpLog.Close()
-
-	multiWriter := io.MultiWriter(fpLog, os.Stdout)
-	log.SetOutput(multiWriter)
+	makeChannel("official")
+	makeChannel("minor")
 
 	go http.HandleFunc("/", home)
-	http.HandleFunc("/ws", handleConnections)
-	go savelog()
-	go handleMessages()
+	go http.HandleFunc("/login", login)
+	go runChannel()
+	go commendInput()
 
-	log := []string{`O`, time.Now().String(), `SERVER`, `SERVER`, "http server started on :3000"}
-	go getLogs(log...)
-
-	err = http.ListenAndServe(":3000", nil)
-	if err != nil {
-		log := []string{`E`, time.Now().String(), `SERVER`, `SERVER`, err.Error()}
-		go getLogs(log...)
-	}
+	http.ListenAndServe(":3000", nil)
 }
 
-func home(w http.ResponseWriter, r *http.Request) {
+func commendInput() {
+	var input string
+	for {
+		fmt.Scan(&input)
+		if input == "/exit" {
+			os.Exit(0)
+		}
+	}
+
+}
+
+func home(w http.ResponseWriter, _ *http.Request) {
+	fmt.Fprintln(w, "SERVER IS RUNNING!")
+}
+
+func login(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log := []string{`E`, time.Now().String(), `SERVER`, `SERVER`, err.Error()}
-		go getLogs(log...)
+		log.Println(err)
+		return
 	}
 
 	defer ws.Close()
 
-	var validLogin = false
+	var loginInfo LoginInfo
 
-	for !validLogin {
-		_, ID, err := ws.ReadMessage()
-		_, PW, err := ws.ReadMessage()
-		if err != nil {
-			log := []string{`E`, time.Now().String(), `SERVER`, `SERVER`, err.Error()}
-			go getLogs(log...)
-		}
+Login:
+	err = ws.ReadJSON(&loginInfo)
+	if err != nil {
+		return
+	}
 
-		validLogin = requestLogin(string(ID), string(PW))
+	connect := requestLogin(loginInfo)
+	if !connect {
+		ws.WriteMessage(1, []byte("B"))
+		goto Login
+	}
 
-		if validLogin {
-			ws.WriteMessage(1, []byte(`G`))
-			continue
+	_, exist := logined[loginInfo.ID]
+	if exist {
+		ws.WriteMessage(1, []byte("D"))
+	}
+
+	ws.WriteMessage(1, []byte("G"))
+	ws.ReadJSON(&loginInfo)
+
+	logined[loginInfo.ID] = loginInfo.USERNAME
+}
+
+func runChannel() {
+	go http.HandleFunc("/channel", channelShow)
+
+	for channel := range channelList {
+		go http.HandleFunc("/channel/"+channel, channelRoom)
+	}
+}
+
+func channelShow(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	defer ws.Close()
+
+	for channel := range channelList {
+		ws.WriteMessage(1, []byte(channel+" : "+strconv.Itoa(channelList[channel])))
+	}
+	ws.WriteMessage(1, []byte("/exit"))
+}
+
+func channelRoom(w http.ResponseWriter, r *http.Request) {
+	var channel = r.URL.Path
+	channel = strings.Split(channel, "/")[2]
+
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	defer ws.Close()
+
+	if channelList[channel] > 29 {
+		ws.WriteMessage(1, []byte(channel+" channel is fulled!"))
+		return
+	}
+
+	channelUser[channel][ws] = true
+	channelList[channel]++
+	ws.WriteMessage(1, []byte(channel+" channel connected("+strconv.Itoa(channelList[channel])+"/30)"))
+
+	go spreadMsg(ws, channel)
+	channelChat(ws, channel)
+}
+
+func requestLogin(loginInfo LoginInfo) bool {
+	db, err := sql.Open("mysql", "root:1234@tcp(logindb:3306)/logindb")
+	if err != nil {
+		log.Print(err)
+		return false
+	}
+
+	defer db.Close()
+	var password string
+
+	err = db.QueryRow("SELECT PW FROM LoginInfo WHERE ID = ?", loginInfo.ID).Scan(&password)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			password = ""
 		} else {
-			ws.WriteMessage(1, []byte(`B`))
-		}
-	}
-}
-
-func handleConnections(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log := []string{`E`, time.Now().String(), `SERVER`, `SERVER`, err.Error()}
-		go getLogs(log...)
-	}
-
-	defer ws.Close()
-
-	_, name, err := ws.ReadMessage()
-	if err != nil {
-		log := []string{`E`, time.Now().String(), `SERVER`, `SERVER`, err.Error()}
-		go getLogs(log...)
-	}
-
-	clients[ws] = string(name)
-
-	log := []string{`L`, time.Now().String(), `SERVER`, clients[ws], "Connected"}
-	go getLogs(log...)
-
-	for {
-		var msg Message
-		err := ws.ReadJSON(&msg)
-
-		log := []string{`S`, msg.Time, msg.Username, `SERVER`, msg.Message}
-		go getLogs(log...)
-
-		if err != nil {
-			log := []string{`S`, msg.Time, msg.Username, `SERVER`, err.Error()}
-			go getLogs(log...)
-			delete(clients, ws)
-		}
-		broadcast <- msg
-
-		if msg.Connect == -1 {
-			break
-		}
-	}
-}
-
-func handleMessages() {
-
-	for {
-		msg := <-broadcast
-		if msg.Connect == -1 {
-			msg.Message = msg.Username + " Disconnected"
-		}
-
-		for client := range clients {
-
-			if msg.Connect == -1 && clients[client] == msg.Username {
-				log := []string{`L`, time.Now().String(), `SERVER`, clients[client], "Disconnected"}
-				go getLogs(log...)
-				client.Close()
-				delete(clients, client)
-				continue
-			}
-
-			err := client.WriteJSON(msg)
-			if err != nil {
-				log := []string{`L`, time.Now().String(), `SERVER`, clients[client], err.Error()}
-				go getLogs(log...)
-				client.Close()
-				delete(clients, client)
-			}
-
-			log := []string{`S`, time.Now().String(), `SERVER`, clients[client], msg.Message}
-			go getLogs(log...)
-
-		}
-	}
-}
-
-func getLogs(logs ...string) {
-	var cast Log
-	cast.Type = logs[0]
-	cast.Time = logs[1]
-	cast.Host = logs[2]
-	cast.Guest = logs[3]
-	cast.Message = logs[4]
-
-	log.Printf("%s %s %s %s %s", cast.Type, cast.Time, cast.Host, cast.Guest, cast.Message)
-
-	logcast <- cast
-}
-
-func savelog() {
-	/*Dummy*/
-}
-
-/*This may not work.*/
-func requestLogin(ID string, PW string) bool {
-	var url = `http://login:1000`
-	buffer := make([]byte, 8)
-	var valid int
-
-	connect, err := net.Dial("tcp", url)
-	if err != nil {
-		log := []string{`E`, time.Now().String(), `SERVER`, `SERVER`, err.Error()}
-		go getLogs(log...)
-	} else {
-		connect.Write([]byte(ID))
-		valid, _ = connect.Read(buffer)
-		if valid == 0 {
-			connect.Write([]byte(PW))
-			valid, _ = connect.Read(buffer)
+			fmt.Println(err)
 		}
 	}
 
-	if valid == 0 {
+	if password == loginInfo.PW {
 		return true
 	} else {
 		return false
 	}
+
+}
+
+func channelChat(ws *websocket.Conn, channel string) {
+	for {
+		var msg Message
+		err := ws.ReadJSON(&msg)
+		if err != nil {
+			log.Println(err)
+			delete(channelUser[channel], ws)
+			delete(logined, msg.ID)
+			channelList[channel]--
+			break
+		}
+
+		if string(msg.MSG) == "" {
+			continue
+		}
+
+		message[channel] <- msg
+		log.Println(msg.ID + " : " + msg.MSG)
+	}
+}
+
+func spreadMsg(ws *websocket.Conn, channel string) {
+	for {
+		msg := <-message[channel]
+		for client := range channelUser[channel] {
+			client.WriteMessage(1, []byte(logined[msg.ID]+" : "+msg.MSG))
+		}
+	}
+}
+
+func makeChannel(name string) {
+	channelList[name] = 0
+	message[name] = make(chan Message)
+	channelUser[name] = make(map[*websocket.Conn]bool)
 }
