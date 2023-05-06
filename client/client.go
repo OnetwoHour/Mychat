@@ -3,135 +3,150 @@ package main
 import (
 	"bufio"
 	"flag"
+	"fmt"
 	"log"
 	"net/url"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-type Message struct {
-	Time     string `json:"time"`
-	Username string `json:"username"`
-	Message  string `json:"message"`
-	Connect  int    `json:"connect"`
+type LoginInfo struct {
+	ID       string `json:"id"`
+	PW       string `json:"pw"`
+	USERNAME string `json:"username"`
 }
 
-var broadcast = make(chan Message)
-var upgrader = websocket.Upgrader{}
+type Message struct {
+	ID  string `json:"id"`
+	MSG string `json:"msg"`
+}
+
+var addr = flag.String("addr", "server:3000", "http service address")
 var kbReader = bufio.NewReader(os.Stdin)
-var addr = flag.String("addr", "localhost:8000", "http service address")
-var connect = make(chan bool)
+var loginInfo LoginInfo
 
 func main() {
-	fplog, err := os.OpenFile("Clientlog.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		panic(err)
-	}
-	defer fplog.Close()
-	log.SetOutput(fplog)
-	flag.Parse()
+	println("ID/PW : root/1234, guest/1234")
 
 	login()
+	channelConnect()
+	ws := inputChannel()
+	defer ws.Close()
 
-	u := url.URL{Scheme: "ws", Host: *addr, Path: "/ws"}
-	log.Printf("Connection to %s", u.String())
+	go receivemsg(ws)
+	input(ws)
+}
 
+func connectws(path string) *websocket.Conn {
+	u := url.URL{Scheme: "ws", Host: *addr, Path: path}
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-	if err != nil {
-		log.Fatal("dial: ", err)
-	}
-
-	print("Username : ")
-	username, err := kbReader.ReadString('\n')
 	if err != nil {
 		log.Fatal(err)
 	}
-	username = strings.TrimSpace(username)
-	c.WriteMessage(1, []byte(username))
-
-	var msg Message
-	msg.Username = username
-	msg.Connect = 0
-
-	go input(msg)
-	go receivemsg(c)
-	sendmsg(c)
+	return c
 }
 
 func login() {
-	u := url.URL{Scheme: "login", Host: *addr, Path: "/"}
-	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	ws := connectws("/login")
+	defer ws.Close()
+
+login:
+	fmt.Print("ID : ")
+	fmt.Scan(&loginInfo.ID)
+	fmt.Print("PW : ")
+	fmt.Scan(&loginInfo.PW)
+
+	err := ws.WriteJSON(loginInfo)
 	if err != nil {
-		log.Fatal("dial: ", err)
+		log.Fatal(err)
 	}
 
-	defer c.Close()
+	_, res, _ := ws.ReadMessage()
+	if string(res) == "B" {
+		println("Wrong ID/PW!")
+		goto login
+	} else if string(res) == "D" {
+		println("Already logined ID!")
+		goto login
+	}
 
-	for {
-		print("ID : ")
-		ID, _ := kbReader.ReadString('\n')
-		ID = strings.TrimSpace(ID)
-		c.WriteMessage(1, []byte(ID))
-
-		print("PW : ")
-		PW, _ := kbReader.ReadString('\n')
-		PW = strings.TrimSpace(PW)
-		c.WriteMessage(1, []byte(PW))
-
-		_, success, _ := c.ReadMessage()
-		if string(success) == "G" {
-			println("Login Successed")
-			break
-		} else {
-			println("Login Failed")
-		}
+	print("Login Successed!\nType your instant username to use : ")
+	fmt.Scan(&loginInfo.USERNAME)
+	println(loginInfo.USERNAME)
+	err = ws.WriteJSON(loginInfo)
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
-func sendmsg(ws *websocket.Conn) {
-	for {
-		msg := <-broadcast
-		if strings.Compare(msg.Message, `/exit`) == 0 {
-			msg.Connect = -1
-		}
-		err := ws.WriteJSON(msg)
-		if err != nil {
-			log.Printf("error: %v", err)
-		}
-		log.Printf("S %s %s", msg.Username, msg.Message)
+func channelConnect() {
+	ws := connectws("/channel")
+	defer ws.Close()
 
-		if msg.Connect == -1 {
-			os.Exit(0)
-		}
-	}
+	println("\n==========CHANNEL LIST==========")
+	println(" CHANNEL NAME : NUMBER OF USERS")
+	println("================================")
+	receivemsg(ws)
+	println("================================")
 }
 
-func input(msg Message) {
+func input(w *websocket.Conn) {
+	var msg Message
+	msg.ID = loginInfo.ID
+
 	for {
 		input, err := kbReader.ReadString('\n')
 		if err != nil {
 			log.Fatal(err)
 		}
-		msg.Message = strings.TrimSpace(input)
-		msg.Time = time.Now().String()
+		input = strings.TrimSpace(input)
 
-		broadcast <- msg
+		if string(input) == "/exit" {
+			break
+		}
+
+		msg.MSG = input
+		w.WriteJSON(msg)
 	}
 }
 
-func receivemsg(ws *websocket.Conn) {
+func receivemsg(w *websocket.Conn) {
 	for {
-		var msg Message
-		err := ws.ReadJSON(&msg)
-
+		_, msg, err := w.ReadMessage()
 		if err != nil {
 			log.Fatal(err)
 		}
-		log.Printf("R %s %s", msg.Username, msg.Message)
-		println(msg.Time, " ", msg.Username, " : ", msg.Message)
+
+		if string(msg) == "/exit" {
+			break
+		}
+		println(string(msg))
+	}
+}
+
+func inputChannel() *websocket.Conn {
+	var channel string
+
+	print("Channel to join : ")
+	fmt.Scan(&channel)
+
+	ws := joinChannel(channel)
+
+	return ws
+}
+
+func joinChannel(channalName string) *websocket.Conn {
+
+	ws := connectws("/channel/" + channalName)
+
+	_, msg, err := ws.ReadMessage()
+	if err != nil {
+		log.Println(err)
 	}
 
+	println(string(msg))
+
+	return ws
 }
